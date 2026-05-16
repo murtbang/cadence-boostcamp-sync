@@ -246,6 +246,12 @@ async def sync():
 
     print(f"=== Sync complete. {new_count} new workout(s) inserted ===")
 
+    # TEMP: inspect get_home_muscle() shape
+    import json
+    muscle_resp = await api.get_home_muscle()
+    print("=== get_home_muscle() ===")
+    print(json.dumps(muscle_resp, indent=2))
+
 
 def _next_focus(completed: list[str]) -> str:
     n = len(completed)
