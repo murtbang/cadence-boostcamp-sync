@@ -246,16 +246,19 @@ async def sync():
 
     print(f"=== Sync complete. {new_count} new workout(s) inserted ===")
 
-    # TEMP: inspect get_home_muscle() with LA timezone offset (-420 = PDT)
-    import json
-    muscle_resp = await api.get_home_muscle(timezone_offset=-420)
-    print("=== get_home_muscle(timezone_offset=-420) ===")
-    print(json.dumps(muscle_resp, indent=2))
-
-    # Also try get_home_summary for comparison
+    # Upsert summary stats (streak, totals) for the Training view
     summary_resp = await api.get_home_summary(timezone_offset=-420)
-    print("=== get_home_summary(timezone_offset=-420) ===")
-    print(json.dumps(summary_resp, indent=2))
+    summary_data = summary_resp.get("data", {})
+    if summary_data:
+        sb.table("boostcamp_summary").upsert({
+            "id":              "singleton",
+            "week_streak":     summary_data.get("week_streak", 0),
+            "total_workouts":  summary_data.get("total_workouts", 0),
+            "total_hours":     float(summary_data.get("total_hours", 0)),
+            "total_weight_lb": float(summary_data.get("total_weight", 0)),
+            "synced_at":       datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="id").execute()
+        print(f"  Summary: {summary_data.get('week_streak')} week streak, {summary_data.get('total_workouts')} workouts")
 
 
 def _next_focus(completed: list[str]) -> str:
