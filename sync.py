@@ -212,41 +212,46 @@ async def sync():
             existing_ids.add(wid)
             new_count += 1
 
-            # Discord notification for each new workout
-            muscles_str   = ", ".join(muscles) if muscles else "—"
-            exercises_str = ", ".join(exercise_names[:5])
-            if len(exercise_names) > 5:
-                exercises_str += f" +{len(exercise_names) - 5} more"
+            # Only notify Discord for workouts logged in the last 25 hours
+            workout_dt = datetime.fromisoformat(f"{date_str}T12:00:00+00:00")
+            is_recent = (datetime.now(timezone.utc) - workout_dt).total_seconds() < 90000  # 25h
 
-            # Determine next focus from weekly progress
-            week_start_str = week_start()
-            week_resp = (
-                sb.table("boostcamp_workouts")
-                .select("classification, logged_at")
-                .gte("logged_at", f"{week_start_str}T00:00:00+00:00")
-                .order("logged_at")
-                .execute()
-            )
-            completed_this_week = [r["classification"] for r in (week_resp.data or [])]
-            next_focus = _next_focus(completed_this_week)
+            if is_recent:
+                muscles_str   = ", ".join(muscles) if muscles else "—"
+                exercises_str = ", ".join(exercise_names[:5])
+                if len(exercise_names) > 5:
+                    exercises_str += f" +{len(exercise_names) - 5} more"
 
-            msg = (
-                f"🏋️ **Workout logged: {classification}**\n"
-                f"{exercises_str}\n"
-                f"Worked: {muscles_str}\n"
-                f"Next up: {next_focus}"
-            )
-            discord_notify(msg)
+                # Determine next focus from weekly progress (count-based)
+                week_start_str = week_start()
+                week_resp = (
+                    sb.table("boostcamp_workouts")
+                    .select("classification, logged_at")
+                    .gte("logged_at", f"{week_start_str}T00:00:00+00:00")
+                    .order("logged_at")
+                    .execute()
+                )
+                completed_this_week = [r["classification"] for r in (week_resp.data or [])]
+                next_focus = _next_focus(completed_this_week)
+
+                msg = (
+                    f"🏋️ **Workout logged: {classification}**\n"
+                    f"{exercises_str}\n"
+                    f"Worked: {muscles_str}\n"
+                    f"Next up: {next_focus}"
+                )
+                discord_notify(msg)
+
             print(f"  New workout: {wid} → {classification}")
 
     print(f"=== Sync complete. {new_count} new workout(s) inserted ===")
 
 
 def _next_focus(completed: list[str]) -> str:
-    for i, target in enumerate(WEEKLY_TARGET):
-        if i >= len(completed) or completed[i] != target:
-            return target
-    return "Recovery / Optional"
+    n = len(completed)
+    if n >= len(WEEKLY_TARGET):
+        return "Recovery / Optional"
+    return WEEKLY_TARGET[n]
 
 
 if __name__ == "__main__":
