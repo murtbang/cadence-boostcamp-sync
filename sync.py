@@ -246,11 +246,16 @@ async def sync():
 
     print(f"=== Sync complete. {new_count} new workout(s) inserted ===")
 
-    # TEMP: inspect get_home_muscle() shape
+    # TEMP: inspect get_home_muscle() with LA timezone offset (-420 = PDT)
     import json
-    muscle_resp = await api.get_home_muscle()
-    print("=== get_home_muscle() ===")
+    muscle_resp = await api.get_home_muscle(timezone_offset=-420)
+    print("=== get_home_muscle(timezone_offset=-420) ===")
     print(json.dumps(muscle_resp, indent=2))
+
+    # Also try get_home_summary for comparison
+    summary_resp = await api.get_home_summary(timezone_offset=-420)
+    print("=== get_home_summary(timezone_offset=-420) ===")
+    print(json.dumps(summary_resp, indent=2))
 
 
 def _next_focus(completed: list[str]) -> str:
