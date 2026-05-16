@@ -1,0 +1,253 @@
+"""
+Cadence ↔ Boostcamp sync service.
+Runs on Railway as a cron job (*/15 * * * *).
+Logs in fresh each run, fetches training history,
+classifies workouts, upserts to Supabase, fires Discord on new entries.
+"""
+
+import os
+import asyncio
+from datetime import datetime, timezone, timedelta
+import httpx
+from supabase import create_client, Client
+from boostcampapi import BoostcampAPI
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── env vars ──────────────────────────────────────────────────────────────────
+BOOSTCAMP_EMAIL       = os.environ["BOOSTCAMP_EMAIL"]
+BOOSTCAMP_PASSWORD    = os.environ["BOOSTCAMP_PASSWORD"]
+SUPABASE_URL          = os.environ["SUPABASE_URL"]
+SUPABASE_KEY          = os.environ["SUPABASE_KEY"]
+DISCORD_WEBHOOK_URL   = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+# ── exercise → (classification, muscles) map ──────────────────────────────────
+# Lowercase substring matching — first match wins.
+EXERCISE_MAP: list[tuple[str, str, list[str]]] = [
+    # Push — chest
+    ("bench press",      "Push", ["chest"]),
+    ("incline press",    "Push", ["chest"]),
+    ("incline db",       "Push", ["chest"]),
+    ("chest fly",        "Push", ["chest"]),
+    ("cable fly",        "Push", ["chest"]),
+    ("pec deck",         "Push", ["chest"]),
+    ("push-up",          "Push", ["chest", "triceps"]),
+    ("pushup",           "Push", ["chest", "triceps"]),
+    ("dip",              "Push", ["chest", "triceps"]),
+    # Push — shoulders
+    ("overhead press",   "Push", ["shoulders"]),
+    ("shoulder press",   "Push", ["shoulders"]),
+    ("military press",   "Push", ["shoulders"]),
+    ("lateral raise",    "Push", ["shoulders"]),
+    ("front raise",      "Push", ["shoulders"]),
+    ("arnold",           "Push", ["shoulders"]),
+    # Push — triceps
+    ("tricep",           "Push", ["triceps"]),
+    ("triceps",          "Push", ["triceps"]),
+    ("pushdown",         "Push", ["triceps"]),
+    ("skull crusher",    "Push", ["triceps"]),
+    ("close grip",       "Push", ["triceps"]),
+    # Pull — back
+    ("barbell row",      "Pull", ["back"]),
+    ("cable row",        "Pull", ["back"]),
+    ("seated row",       "Pull", ["back"]),
+    ("chest-supported",  "Pull", ["back"]),
+    ("lat pulldown",     "Pull", ["back"]),
+    ("pull-up",          "Pull", ["back"]),
+    ("pull up",          "Pull", ["back"]),
+    ("pullup",           "Pull", ["back"]),
+    ("chin-up",          "Pull", ["back", "biceps"]),
+    ("chin up",          "Pull", ["back", "biceps"]),
+    ("t-bar row",        "Pull", ["back"]),
+    ("meadows row",      "Pull", ["back"]),
+    ("rack pull",        "Pull", ["back"]),
+    ("deadlift",         "Pull", ["back", "hamstrings"]),
+    # Pull — traps / rear delts
+    ("shrug",            "Pull", ["traps"]),
+    ("face pull",        "Pull", ["rear delts"]),
+    ("rear delt",        "Pull", ["rear delts"]),
+    ("reverse fly",      "Pull", ["rear delts"]),
+    # Pull — biceps
+    ("bicep curl",       "Pull", ["biceps"]),
+    ("biceps curl",      "Pull", ["biceps"]),
+    ("hammer curl",      "Pull", ["biceps"]),
+    ("preacher curl",    "Pull", ["biceps"]),
+    ("concentration",    "Pull", ["biceps"]),
+    ("curl",             "Pull", ["biceps"]),
+    # Legs
+    ("squat",            "Legs", ["quads", "glutes"]),
+    ("leg press",        "Legs", ["quads", "glutes"]),
+    ("hack squat",       "Legs", ["quads"]),
+    ("leg extension",    "Legs", ["quads"]),
+    ("lunge",            "Legs", ["quads", "glutes"]),
+    ("bulgarian",        "Legs", ["quads", "glutes"]),
+    ("step-up",          "Legs", ["quads", "glutes"]),
+    ("romanian",         "Legs", ["hamstrings", "glutes"]),
+    ("rdl",              "Legs", ["hamstrings", "glutes"]),
+    ("good morning",     "Legs", ["hamstrings"]),
+    ("leg curl",         "Legs", ["hamstrings"]),
+    ("hamstring curl",   "Legs", ["hamstrings"]),
+    ("hip thrust",       "Legs", ["glutes"]),
+    ("glute bridge",     "Legs", ["glutes"]),
+    ("calf raise",       "Legs", ["calves"]),
+    ("standing calf",    "Legs", ["calves"]),
+    ("seated calf",      "Legs", ["calves"]),
+    ("abductor",         "Legs", ["glutes"]),
+    ("adductor",         "Legs", ["inner thighs"]),
+]
+
+WEEKLY_TARGET = ["Push", "Pull", "Push", "Pull", "Legs"]
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def classify_exercise(name: str) -> tuple[str, list[str]]:
+    """Return (classification, muscles) for a single exercise name."""
+    lower = name.lower()
+    for keyword, cls, muscles in EXERCISE_MAP:
+        if keyword in lower:
+            return cls, muscles
+    return "Other", []
+
+
+def classify_workout(records: list[dict]) -> tuple[str, list[str]]:
+    """
+    Majority-vote classification across all exercises in a workout.
+    Returns (classification, deduplicated muscle list).
+    """
+    votes: dict[str, int] = {}
+    all_muscles: list[str] = []
+
+    for rec in records:
+        cls, muscles = classify_exercise(rec.get("name", ""))
+        if cls != "Other":
+            votes[cls] = votes.get(cls, 0) + 1
+            for m in muscles:
+                if m not in all_muscles:
+                    all_muscles.append(m)
+
+    if not votes:
+        return "Other", all_muscles
+
+    winner = max(votes, key=lambda k: votes[k])
+    return winner, all_muscles
+
+
+def week_start() -> str:
+    """ISO date string for the most recent Monday (LA time approximation)."""
+    la_now = datetime.now(timezone(timedelta(hours=-7)))
+    days_since_monday = la_now.weekday()  # Mon=0
+    monday = la_now - timedelta(days=days_since_monday)
+    return monday.date().isoformat()
+
+
+def build_workout_id(date_str: str, index: int) -> str:
+    return f"{date_str}-{index}"
+
+
+def discord_notify(message: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        httpx.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+    except Exception as e:
+        print(f"Discord error: {e}")
+
+
+# ── main sync ────────────────────────────────────────────────────────────────
+
+async def sync():
+    print("=== Boostcamp sync starting ===")
+
+    # 1. Login
+    api = BoostcampAPI()
+    await api.login(BOOSTCAMP_EMAIL, BOOSTCAMP_PASSWORD)
+    print("Logged in to Boostcamp")
+
+    # 2. Fetch training history
+    history_resp = await api.get_training_history()
+    history_data: dict = history_resp.get("data", {})
+    print(f"Fetched {len(history_data)} training dates")
+
+    # 3. Connect to Supabase
+    sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    # 4. Fetch existing boostcamp_ids so we know what's new
+    existing_resp = sb.table("boostcamp_workouts").select("boostcamp_id").execute()
+    existing_ids: set[str] = {row["boostcamp_id"] for row in (existing_resp.data or [])}
+
+    new_count = 0
+
+    # Sort dates newest-first; only process last 14 days to keep it fast
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).date().isoformat()
+    recent_dates = sorted(
+        [d for d in history_data.keys() if d >= cutoff],
+        reverse=True
+    )
+
+    for date_str in recent_dates:
+        workouts = history_data[date_str]
+        for i, workout in enumerate(workouts):
+            wid = build_workout_id(date_str, i)
+            if wid in existing_ids:
+                continue  # already synced
+
+            records = workout.get("records", [])
+            classification, muscles = classify_workout(records)
+            exercise_names = [r.get("name", "") for r in records]
+            workout_name = workout.get("name") or workout.get("title") or "Workout"
+
+            row = {
+                "boostcamp_id":    wid,
+                "logged_at":       f"{date_str}T12:00:00+00:00",
+                "workout_name":    workout_name,
+                "classification":  classification,
+                "muscles_json":    muscles,
+                "exercises_json":  exercise_names,
+                "raw_json":        workout,
+            }
+
+            sb.table("boostcamp_workouts").upsert(row, on_conflict="boostcamp_id").execute()
+            existing_ids.add(wid)
+            new_count += 1
+
+            # Discord notification for each new workout
+            muscles_str   = ", ".join(muscles) if muscles else "—"
+            exercises_str = ", ".join(exercise_names[:5])
+            if len(exercise_names) > 5:
+                exercises_str += f" +{len(exercise_names) - 5} more"
+
+            # Determine next focus from weekly progress
+            week_start_str = week_start()
+            week_resp = (
+                sb.table("boostcamp_workouts")
+                .select("classification, logged_at")
+                .gte("logged_at", f"{week_start_str}T00:00:00+00:00")
+                .order("logged_at")
+                .execute()
+            )
+            completed_this_week = [r["classification"] for r in (week_resp.data or [])]
+            next_focus = _next_focus(completed_this_week)
+
+            msg = (
+                f"🏋️ **Workout logged: {classification}**\n"
+                f"{exercises_str}\n"
+                f"Worked: {muscles_str}\n"
+                f"Next up: {next_focus}"
+            )
+            discord_notify(msg)
+            print(f"  New workout: {wid} → {classification}")
+
+    print(f"=== Sync complete. {new_count} new workout(s) inserted ===")
+
+
+def _next_focus(completed: list[str]) -> str:
+    for i, target in enumerate(WEEKLY_TARGET):
+        if i >= len(completed) or completed[i] != target:
+            return target
+    return "Recovery / Optional"
+
+
+if __name__ == "__main__":
+    asyncio.run(sync())
