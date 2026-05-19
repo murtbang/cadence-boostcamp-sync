@@ -173,11 +173,18 @@ async def sync():
     # 3. Connect to Supabase
     sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # 4. Fetch existing boostcamp_ids so we know what's new
-    existing_resp = sb.table("boostcamp_workouts").select("boostcamp_id").execute()
+    # 4. Fetch existing boostcamp_ids so we know what's new (scoped to last 30 days)
+    id_cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).date().isoformat()
+    existing_resp = (
+        sb.table("boostcamp_workouts")
+        .select("boostcamp_id")
+        .gte("logged_at", f"{id_cutoff}T00:00:00+00:00")
+        .execute()
+    )
     existing_ids: set[str] = {row["boostcamp_id"] for row in (existing_resp.data or [])}
 
     new_count = 0
+    auto_logged_dates: set[str] = set()  # avoid calling auto-complete twice for same date
 
     # Sort dates newest-first; only process last 14 days to keep it fast
     cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).date().isoformat()
@@ -211,6 +218,11 @@ async def sync():
             sb.table("boostcamp_workouts").upsert(row, on_conflict="boostcamp_id").execute()
             existing_ids.add(wid)
             new_count += 1
+
+            # Auto-complete matching habits (once per date, idempotent)
+            if date_str not in auto_logged_dates:
+                auto_complete_workout_habit(sb, date_str)
+                auto_logged_dates.add(date_str)
 
             # Only notify Discord for workouts logged in the last 25 hours
             workout_dt = datetime.fromisoformat(f"{date_str}T12:00:00+00:00")
@@ -261,6 +273,37 @@ async def sync():
         print(f"  Summary: {summary_data.get('week_streak')} week streak, {summary_data.get('total_workouts')} workouts")
 
 
+def auto_complete_workout_habit(sb: Client, date_str: str) -> None:
+    """
+    Auto-log any habit whose name contains a workout keyword for the given date.
+    Runs after each newly-synced workout. Safe to call multiple times (idempotent).
+    """
+    TRIGGER_KEYWORDS = ["workout", "run", "gym", "train", "exercise"]
+
+    habits_resp = sb.table("habits").select("id, name").is_("deleted_at", "null").execute()
+    for habit in (habits_resp.data or []):
+        if not any(kw in habit["name"].lower() for kw in TRIGGER_KEYWORDS):
+            continue
+
+        # Already logged for this date? Skip.
+        existing = (
+            sb.table("habit_logs")
+            .select("id")
+            .eq("habit_id", habit["id"])
+            .eq("date", date_str)
+            .execute()
+        )
+        if existing.data:
+            continue
+
+        sb.table("habit_logs").insert({
+            "habit_id": habit["id"],
+            "date":     date_str,
+            "type":     "done",
+        }).execute()
+        print(f"  ✅ Auto-logged habit '{habit['name']}' for {date_str}")
+
+
 def _next_focus(completed: list[str]) -> str:
     n = len(completed)
     if n >= len(WEEKLY_TARGET):
@@ -269,4 +312,9 @@ def _next_focus(completed: list[str]) -> str:
 
 
 if __name__ == "__main__":
-    asyncio.run(sync())
+    try:
+        asyncio.run(asyncio.wait_for(sync(), timeout=120))
+    except Exception:
+        import traceback
+        discord_notify(f"❌ Boostcamp sync crashed:\n```{traceback.format_exc()[-1500:]}```")
+        raise
