@@ -7,6 +7,7 @@ classifies workouts, upserts to Supabase, fires Discord on new entries.
 
 import os
 import asyncio
+import traceback as tb
 from datetime import datetime, timezone, timedelta
 import httpx
 from supabase import create_client, Client
@@ -155,18 +156,38 @@ def discord_notify(message: str) -> None:
         print(f"Discord error: {e}")
 
 
+# ── retry helper ─────────────────────────────────────────────────────────────
+
+async def retry(coro_fn, attempts: int = 3, base_delay: float = 5.0, label: str = "call"):
+    """Retry an async callable with exponential backoff."""
+    for attempt in range(attempts):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            cause = ""
+            if e.__cause__:
+                cause = f" (caused by: {type(e.__cause__).__name__}: {e.__cause__})"
+            msg = f"  ⚠️ {label} attempt {attempt + 1}/{attempts} failed: {e}{cause}"
+            print(msg)
+            if attempt == attempts - 1:
+                raise
+            await asyncio.sleep(base_delay * (2 ** attempt))
+
+
 # ── main sync ────────────────────────────────────────────────────────────────
 
 async def sync():
     print("=== Boostcamp sync starting ===")
 
-    # 1. Login
+    # 1. Login (with retry)
     api = BoostcampAPI()
-    await api.login(BOOSTCAMP_EMAIL, BOOSTCAMP_PASSWORD)
+    await retry(lambda: api.login(BOOSTCAMP_EMAIL, BOOSTCAMP_PASSWORD),
+                attempts=3, base_delay=5, label="login")
     print("Logged in to Boostcamp")
 
-    # 2. Fetch training history
-    history_resp = await api.get_training_history()
+    # 2. Fetch training history (with retry)
+    history_resp = await retry(lambda: api.get_training_history(),
+                               attempts=3, base_delay=10, label="get_training_history")
     history_data: dict = history_resp.get("data", {})
     print(f"Fetched {len(history_data)} training dates")
 
@@ -259,7 +280,8 @@ async def sync():
     print(f"=== Sync complete. {new_count} new workout(s) inserted ===")
 
     # Upsert summary stats (streak, totals) for the Training view
-    summary_resp = await api.get_home_summary(timezone_offset=-420)
+    summary_resp = await retry(lambda: api.get_home_summary(timezone_offset=-420),
+                               attempts=3, base_delay=5, label="get_home_summary")
     summary_data = summary_resp.get("data", {})
     if summary_data:
         sb.table("boostcamp_summary").upsert({
@@ -314,7 +336,16 @@ def _next_focus(completed: list[str]) -> str:
 if __name__ == "__main__":
     try:
         asyncio.run(asyncio.wait_for(sync(), timeout=120))
-    except Exception:
-        import traceback
-        discord_notify(f"❌ Boostcamp sync crashed:\n```{traceback.format_exc()[-1500:]}```")
+    except Exception as exc:
+        full = tb.format_exc()
+        # Walk the cause chain so empty-message wrapper exceptions show the real error
+        cause_chain = []
+        e = exc
+        while e:
+            cause_chain.append(f"{type(e).__name__}: {e!r}")
+            e = e.__cause__ or (e.__context__ if not getattr(e, '__suppress_context__', False) else None)
+        cause_str = " → ".join(cause_chain[:4])
+        discord_notify(
+            f"❌ Boostcamp sync crashed: {cause_str}\n```{full[-1200:]}```"
+        )
         raise
