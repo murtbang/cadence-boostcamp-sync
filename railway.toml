@@ -3,5 +3,6 @@ builder = "nixpacks"
 
 [deploy]
 startCommand = "python sync.py"
-cronSchedule = "*/15 * * * *"
-restartPolicyType = "never"
+cronSchedule = "0 21,1,6 * * *"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
