@@ -164,10 +164,15 @@ async def retry(coro_fn, attempts: int = 3, base_delay: float = 5.0, label: str 
         try:
             return await coro_fn()
         except Exception as e:
-            cause = ""
-            if e.__cause__:
-                cause = f" (caused by: {type(e.__cause__).__name__}: {e.__cause__})"
-            msg = f"  ⚠️ {label} attempt {attempt + 1}/{attempts} failed: {e}{cause}"
+            # Walk the full cause chain — wrapper exceptions often have empty str()
+            chain = []
+            node = e
+            while node is not None:
+                chain.append(f"{type(node).__name__}({node!r})")
+                node = node.__cause__ or (
+                    node.__context__ if not getattr(node, '__suppress_context__', False) else None
+                )
+            msg = f"  ⚠️ {label} attempt {attempt + 1}/{attempts} failed: {' → '.join(chain[:4])}"
             print(msg)
             if attempt == attempts - 1:
                 raise
@@ -186,7 +191,7 @@ async def sync():
     print("Logged in to Boostcamp")
 
     # 2. Fetch training history (with retry)
-    history_resp = await retry(lambda: api.get_training_history(),
+    history_resp = await retry(lambda: api.get_training_history(timezone_offset=-420),
                                attempts=3, base_delay=10, label="get_training_history")
     history_data: dict = history_resp.get("data", {})
     print(f"Fetched {len(history_data)} training dates")
