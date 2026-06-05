@@ -196,20 +196,6 @@ async def sync():
     history_data: dict = history_resp.get("data", {})
     print(f"Fetched {len(history_data)} training dates")
 
-    # ── TEMP DEBUG: why are recent workouts not landing? ──────────────────────
-    _keys_desc = sorted(history_data.keys(), reverse=True)
-    print(f"  [dbg] 8 most-recent date keys: {_keys_desc[:8]}")
-    for _back in range(5):
-        _d = (datetime.now(timezone(timedelta(hours=-7))) - timedelta(days=_back)).date().isoformat()
-        _wk = history_data.get(_d)
-        if _wk is None:
-            print(f"  [dbg] {_d}: MISSING from history_data")
-        else:
-            for _w in _wk:
-                _names = [r.get("name", "?") for r in _w.get("records", [])]
-                print(f"  [dbg] {_d}: '{_w.get('name') or _w.get('title')}' records={len(_names)} {_names[:4]}")
-    # ──────────────────────────────────────────────────────────────────────────
-
     # 3. Connect to Supabase
     sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
