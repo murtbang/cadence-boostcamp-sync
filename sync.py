@@ -299,6 +299,8 @@ async def sync():
         }, on_conflict="id").execute()
         print(f"  Summary: {summary_data.get('week_streak')} week streak, {summary_data.get('total_workouts')} workouts")
 
+    return new_count
+
 
 def auto_complete_workout_habit(sb: Client, date_str: str) -> None:
     """
